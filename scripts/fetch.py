@@ -114,7 +114,9 @@ def public_host(url):
 def save_thumb(src, path):
     if not public_host(src):
         raise RuntimeError('refused host')
-    raw = get(src + ('&' if '?' in src else '?') + 'width=720')
+    # Shopify's CDN resizes with ?width=; other shops' image URLs are fetched as they are
+    url = src + ('&' if '?' in src else '?') + 'width=720' if 'cdn.shopify.com' in src else src
+    raw = get(url)
     if len(raw) > 15_000_000:
         raise RuntimeError('image too large')
     im = Image.open(io.BytesIO(raw))
