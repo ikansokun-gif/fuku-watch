@@ -490,7 +490,7 @@ def cmd_discover(date):
     for sid, st in sorted(sites.items()):
         idx = (st.get('brand_index') or '').strip()
         tpl = (st.get('search_url') or '').strip()
-        if st.get('auto') is False or not (idx or '{q}' in tpl):
+        if st.get('auto') is False or st.get('auto_active') is False or not (idx or '{q}' in tpl):
             continue
         pend = []
         for bid, b in sorted(brands.items()):
