@@ -27,8 +27,9 @@ import base64, datetime, glob, hashlib, json, os, re, sys
 from urllib.parse import urlparse, quote
 
 FW = 'fw'
-MAX_VERIFY = 25
-MAX_IMAGE_BACKFILL = 60
+MAX_VERIFY = 12          # page reads for checking (price drops only): keeps AI usage low
+MAX_IMAGE_BACKFILL = 0   # photos are off
+VERIFY_KINDS = ('drop',)
 GENDERS = ('M', 'W', 'U', '-')
 PRUNE_DAYS = 120
 DISCOVER_RETRY_DAYS = 30
@@ -224,9 +225,9 @@ def cmd_diff(date):
         r['image'] = [k for k, it in items.items()
                       if it.get('in_stock') and not it.get('image') and k not in queued][:MAX_IMAGE_BACKFILL]
         result[tid] = r
-        for kind in ('drop', 'new', 'restock', 'image'):
+        for kind in VERIFY_KINDS:
             for k in r[kind]:
-                if len(todo) < MAX_VERIFY + (MAX_IMAGE_BACKFILL if kind == 'image' else 0):
+                if len(todo) < MAX_VERIFY:
                     title = rows[k]['title'] if rows and k in rows else items[k].get('title', '')
                     todo.append(f"{tid}|{k}\t{verify_url(t, k)}\t{kind}\t{title}")
     dump(os.path.join(FW, 'diff.json'), result)
