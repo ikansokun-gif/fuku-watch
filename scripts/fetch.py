@@ -103,9 +103,23 @@ def summarize(p):
     }
 
 
+def public_host(url):
+    """Only fetch photos from ordinary public hostnames (the URLs come from shop pages)."""
+    host = (urlparse(url).hostname or '').lower()
+    if not host or '.' not in host or host == 'localhost' or host.endswith(('.local', '.internal')):
+        return False
+    return not re.fullmatch(r'[0-9.]+|\[?[0-9a-f:]+\]?', host)
+
+
 def save_thumb(src, path):
+    if not public_host(src):
+        raise RuntimeError('refused host')
     raw = get(src + ('&' if '?' in src else '?') + 'width=720')
+    if len(raw) > 15_000_000:
+        raise RuntimeError('image too large')
     im = Image.open(io.BytesIO(raw))
+    if im.width * im.height > 50_000_000:
+        raise RuntimeError('image too large')
     if im.mode not in ('RGB', 'L'):
         bg = Image.new('RGB', im.size, (255, 255, 255))
         bg.paste(im.convert('RGBA'), mask=im.convert('RGBA').split()[-1])
