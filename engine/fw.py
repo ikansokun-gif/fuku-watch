@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 
 FW = 'fw'
 MAX_VERIFY = 25
-MAX_IMAGE_BACKFILL = 10
+MAX_IMAGE_BACKFILL = 60
 GENDERS = ('M', 'W', 'U', '-')
 PRUNE_DAYS = 120
 
