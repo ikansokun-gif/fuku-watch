@@ -246,7 +246,8 @@ def cmd_apply(date, hhmm):
     feed = load(os.path.join(FW, 'feed', f'{month}.json')) or {'month': month, 'events': []}
     status = load(os.path.join(FW, 'meta', 'status.json')) or {}
     cutoff = (datetime.date.fromisoformat(date) - datetime.timedelta(days=PRUNE_DAYS)).isoformat()
-    now_iso = f'{date}T{hhmm}:00+09:00'
+    _h = str(hhmm).replace(':', '').zfill(4)
+    now_iso = f'{date}T{_h[:2]}:{_h[2:4]}:00+09:00'
     new_events, errors, written = [], [], []
     seen_ev = {(e['date'], e['type'], e['target_id'], e['key']) for e in feed['events']}
 
