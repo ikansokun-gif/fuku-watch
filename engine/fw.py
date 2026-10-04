@@ -19,15 +19,21 @@ Commands:
   python3 fw.py apply <YYYY-MM-DD> <HH:MM>  -> fw/out/* docs to write + fw/out/summary.txt
   python3 fw.py want <repo dir>      -> writes <repo>/want.json and <repo>/targets.json for the GitHub photo job
   python3 fw.py thumbs <repo dir>    -> photo docs for the page from <repo>/thumbs/*.jpg (fw/out/thumbs, batches to write)
+  python3 fw.py discover <YYYY-MM-DD>        -> pages to read to find each brand on each site (fw/discover/plan.json)
+  python3 fw.py discover-apply <YYYY-MM-DD>  -> new check targets (fw/out/targets, also copied to fw/targets)
+  python3 fw.py schedule                     -> run times the owner chose on the page (meta/settings) -> cron
 """
 import base64, datetime, glob, hashlib, json, os, re, sys
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 FW = 'fw'
 MAX_VERIFY = 25
 MAX_IMAGE_BACKFILL = 60
 GENDERS = ('M', 'W', 'U', '-')
 PRUNE_DAYS = 120
+DISCOVER_RETRY_DAYS = 30
+MAX_SEARCH_PER_RUN = 30
+TOP_STALE_DAYS = 14   # search-style targets: not seen for this long -> treat as gone
 
 
 def load(p, default=None):
@@ -159,8 +165,10 @@ def brand_matches(vendor, names):
 
 
 def is_full(t, cat, date):
+    if t.get('scan') == 'top':
+        return False
     if not cat or not cat.get('baseline_done'):
-        return True
+        return False  # first look: daily pages only; the first full scan adds deeper stock quietly
     if int(t.get('daily_pages', 2) or 0) == 0:
         return True
     return datetime.date.fromisoformat(date).weekday() == 6  # Sunday
@@ -178,7 +186,7 @@ def cmd_pages(date):
         r = resolve(t, sites, brands)
         plan.append({'tid': tid, 'brand': r['brand'], 'site': r['site'], 'url': t['url'],
                      'platform': platform(t['url']), 'mode': 'full' if full else 'daily',
-                     'daily_pages': int(t.get('daily_pages', 2) or 2) if not full else None,
+                     'daily_pages': (int(t.get('daily_pages', 2) or 0) or 3) if not full else None,
                      'all_rows_pages': int(t.get('daily_pages', 2) or 2) or 2,
                      'baseline': not (cat and cat.get('baseline_done'))})
     dump(os.path.join(FW, 'pages.json'), plan)
@@ -293,7 +301,7 @@ def cmd_apply(date, hhmm):
                     items[k]['sizes'] = vsizes
                 if row.get('gender'):
                     items[k]['gender'] = row['gender']
-                if not baseline and stock:
+                if not baseline and stock and not (row['deep'] and cat.get('quiet_deep')):
                     add_event({**base_ev, 'type': 'new', 'key': k, 'title': row['title'],
                                'url': cat['origin'] + k, 'image': vimg, 'gender': row.get('gender'),
                                'price': price, 'old_price': None, 'list_price': price, 'in_stock': True})
@@ -335,6 +343,14 @@ def cmd_apply(date, hhmm):
                     if k not in rows:
                         items[k]['in_stock'] = False
             cat['last_full'] = date
+            cat['quiet_deep'] = False
+        if t.get('scan') == 'top':
+            stale = (datetime.date.fromisoformat(date) - datetime.timedelta(days=TOP_STALE_DAYS)).isoformat()
+            for it in items.values():
+                if it.get('in_stock') and it.get('last_seen', date) < stale:
+                    it['in_stock'] = False
+        if baseline and t.get('scan') != 'top':
+            cat['quiet_deep'] = True
         for k in [k for k, it in items.items() if not it.get('in_stock') and it.get('last_seen', date) < cutoff]:
             del items[k]
         cat['baseline_done'] = True
@@ -455,6 +471,128 @@ def cmd_thumbs(repo):
         print(f'BATCH {i}: ' + json.dumps(b, ensure_ascii=False))
 
 
+def brand_names(b):
+    return [n for n in [b.get('name')] + list(b.get('aliases') or []) if isinstance(n, str) and n.strip()]
+
+
+def safe_id(x):
+    return re.sub(r'[^A-Za-z0-9_\-.~:@+]', '_', x)[:150]
+
+
+def cmd_discover(date):
+    sites, brands, targets = docs('sites'), docs('brands'), docs('targets')
+    rec = (load(os.path.join(FW, 'meta', 'discovery.json')) or {}).get('pairs', {})
+    cutoff = (datetime.date.fromisoformat(date) - datetime.timedelta(days=DISCOVER_RETRY_DAYS)).isoformat()
+    have = {(t.get('site_id'), t.get('brand_id')) for t in targets.values()}
+    plan, searches = [], 0
+    for sid, st in sorted(sites.items()):
+        idx = (st.get('brand_index') or '').strip()
+        tpl = (st.get('search_url') or '').strip()
+        if st.get('auto') is False or not (idx or '{q}' in tpl):
+            continue
+        pend = []
+        for bid, b in sorted(brands.items()):
+            if (sid, bid) in have:
+                continue
+            r = rec.get(f'{sid}|{bid}')
+            if r and r.get('date', '') > cutoff and r.get('names') == brand_names(b):
+                continue
+            pend.append(bid)
+        if not pend:
+            continue
+        if '{q}' in tpl:
+            for bid in pend:
+                if searches >= MAX_SEARCH_PER_RUN:
+                    break
+                searches += 1
+                plan.append({'how': 'search', 'sid': sid, 'bids': [bid],
+                             'url': tpl.replace('{q}', quote(brands[bid]['name'])),
+                             'file': f'{safe_id(sid)}--{safe_id(bid)}.txt'})
+        else:
+            plan.append({'how': 'index', 'sid': sid, 'bids': pend, 'url': idx, 'file': f'{safe_id(sid)}.txt'})
+    dump(os.path.join(FW, 'discover', 'plan.json'), plan)
+    if not plan:
+        print('DISCOVER: none')
+    for p in plan:
+        if p['how'] == 'index':
+            names = '; '.join(f"{bid}={' / '.join(brand_names(brands[bid]))}" for bid in p['bids'])
+            print(f"INDEX\t{p['url']}\tsave to fw/discover/{p['file']}\tbrands: {names}")
+        else:
+            print(f"SEARCH\t{p['url']}\tsave to fw/discover/{p['file']}")
+
+
+def cmd_discover_apply(date):
+    sites, brands, targets = docs('sites'), docs('brands'), docs('targets')
+    plan = load(os.path.join(FW, 'discover', 'plan.json'), []) or []
+    disc = load(os.path.join(FW, 'meta', 'discovery.json')) or {}
+    pairs = disc.setdefault('pairs', {})
+    have_urls = {t.get('url') for t in targets.values()}
+    created, written = [], []
+
+    def make(sid, bid, url, scan):
+        st, b = sites.get(sid, {}), brands.get(bid, {})
+        tid = f'ta-{safe_id(sid)}-{safe_id(bid)}'[:190]
+        doc = {'site_id': sid, 'brand_id': bid, 'site': st.get('name', ''), 'brand': b.get('name', ''), 'url': url,
+               'daily_pages': 1, 'active': st.get('auto_active', True) is not False, 'auto': True, 'scan': scan,
+               'created_at': f'{date}T00:00:00+09:00'}
+        dump(os.path.join(FW, 'out', 'targets', f'{tid}.json'), doc)
+        dump(os.path.join(FW, 'targets', f'{tid}.json'), doc)
+        have_urls.add(url)
+        created.append(f"{b.get('name')} @ {st.get('name')}" + ('' if doc['active'] else '（一時停止で作成）'))
+        written.append(f'targets/{tid}')
+
+    for p in plan:
+        sid = p['sid']
+        fp = os.path.join(FW, 'discover', p['file'])
+        if not os.path.exists(fp):
+            continue  # not read this time; try again next run
+        text = open(fp, encoding='utf-8').read()
+        if p['how'] == 'index':
+            found = {}
+            for line in text.splitlines():
+                if '|' not in line:
+                    continue
+                bid, url = [x.strip() for x in line.split('|', 1)]
+                if bid in p['bids'] and url.startswith('http') and url not in have_urls:
+                    found[bid] = url.split('#')[0]
+            for bid in p['bids']:
+                if bid in found:
+                    make(sid, bid, found[bid], 'list')
+                pairs[f'{sid}|{bid}'] = {'date': date, 'found': bid in found, 'names': brand_names(brands.get(bid, {}))}
+        else:
+            bid = p['bids'][0]
+            rows, err = parse_lines(fp, False)
+            names = brand_names(brands.get(bid, {}))
+            hit = any(any(norm(n) and norm(n) in norm(r['title']) for n in names) for r in rows.values())
+            if hit and p['url'] not in have_urls:
+                make(sid, bid, p['url'], 'top')
+            pairs[f'{sid}|{bid}'] = {'date': date, 'found': bool(hit), 'names': names}
+    dump(os.path.join(FW, 'out', 'meta', 'discovery.json'), disc)
+    written.append('meta/discovery')
+    print('NEW TARGETS:', ', '.join(created) if created else 'none')
+    print('WRITE:', ' '.join(written))
+
+
+def cmd_schedule():
+    settings = load(os.path.join(FW, 'meta', 'settings.json')) or {}
+    hours = sorted({int(h) for h in settings.get('hours', []) if str(h).isdigit() and 0 <= int(h) <= 23})
+    minute = settings.get('minute')
+    if not hours or not isinstance(minute, int) or not 0 <= minute <= 59:
+        print('SCHEDULE: unchanged')
+        return
+    cron = f"CRON_TZ=Asia/Tokyo {minute} {','.join(map(str, hours))} * * *"
+    status_path = os.path.join(FW, 'out', 'meta', 'status.json')
+    status = load(status_path) or load(os.path.join(FW, 'meta', 'status.json')) or {}
+    if status.get('cron') == cron:
+        print('SCHEDULE: unchanged')
+        return
+    status['cron'] = cron
+    status['times'] = [f'{h}:{minute:02d}' for h in hours]
+    dump(status_path, status)
+    print('SCHEDULE: APPLY', cron)
+
+
 if __name__ == '__main__':
     cmd, args = sys.argv[1], sys.argv[2:]
-    {'pages': cmd_pages, 'diff': cmd_diff, 'apply': cmd_apply, 'want': cmd_want, 'thumbs': cmd_thumbs}[cmd](*args)
+    {'pages': cmd_pages, 'diff': cmd_diff, 'apply': cmd_apply, 'want': cmd_want, 'thumbs': cmd_thumbs,
+     'discover': cmd_discover, 'discover-apply': cmd_discover_apply, 'schedule': cmd_schedule}[cmd](*args)
