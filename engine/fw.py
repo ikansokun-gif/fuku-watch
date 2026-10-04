@@ -2,12 +2,16 @@
 """服セールウォッチ: daily diff engine.
 
 Work dir layout (all under ./fw):
-  targets/<tid>.json      targets collection (ArtifactData list out_dir)
+  targets/<tid>.json      watch targets = one brand on one site (ArtifactData list out_dir)
+  sites/<sid>.json        sites: {name, url, kind: "new"|"used", point_rate}
+  brands/<bid>.json       brands: {name, aliases: [old names]}
   catalog/<tid>.json      catalog collection (ArtifactData list out_dir)
   feed/<YYYY-MM>.json     current month feed doc, if it exists
   meta/status.json        meta/status doc, if it exists
-  scan/<tid>.txt          first pages, every product: "path|price|S or I|title" (or "ERROR=<reason>")
-  scan/<tid>.deep.txt     later pages on full scans, in-stock products only
+  scan/<tid>.txt          first K pages, in-stock products: "path|price|gender|title" (or "ERROR=<reason>")
+                          gender: M men / W women / U unisex / - unknown
+                          (older formats "path|price|S or I|title" and "path|price|I|gender|title" also read)
+  scan/<tid>.deep.txt     pages after K on full scans, same format
   verify.json             {"<tid>|<key>": {"brand": str, "price": int, "available": bool, "image": str, "sizes": [str]} or null}
 Commands:
   python3 fw.py pages <YYYY-MM-DD>   -> which targets to scan and how
@@ -22,6 +26,7 @@ from urllib.parse import urlparse
 FW = 'fw'
 MAX_VERIFY = 25
 MAX_IMAGE_BACKFILL = 10
+GENDERS = ('M', 'W', 'U', '-')
 PRUNE_DAYS = 120
 
 
@@ -79,12 +84,21 @@ def parse_lines(fp, deep):
             continue
         if not line or '=' in line.split('|', 1)[0] or line.count('|') < 3:
             continue
-        path, price, stock, title = [x.strip() for x in line.split('|', 3)]
+        parts = [x.strip() for x in line.split('|')]
+        path, price = parts[0], parts[1]
+        third = parts[2].upper()
+        if len(parts) >= 5 and third[:1] in ('I', 'S') and parts[3].upper() in GENDERS:
+            stock, gender, title = third, parts[3].upper(), '|'.join(parts[4:])
+        elif third in GENDERS:
+            stock, gender, title = 'I', third, '|'.join(parts[3:])
+        else:
+            stock, gender, title = third, '-', '|'.join(parts[3:])
         digits = re.sub(r'[^0-9]', '', price)
         k = key_of(path)
         if not digits or k in ('/', '/products'):
             continue
-        rows[k] = {'price': int(digits), 'in_stock': stock.upper()[:1] != 'S', 'title': title, 'deep': deep}
+        rows[k] = {'price': int(digits), 'in_stock': stock[:1] != 'S', 'title': title.strip(),
+                   'deep': deep, 'gender': gender if gender in ('M', 'W', 'U') else None}
     return rows, error
 
 
@@ -121,6 +135,29 @@ def verify_url(t, key):
     return origin(t['url']) + key
 
 
+def resolve(t, sites=None, brands=None):
+    """Names and settings of a target, from its site and brand records (falls back to the target's own fields)."""
+    sites = sites if sites is not None else docs('sites')
+    brands = brands if brands is not None else docs('brands')
+    s = sites.get(t.get('site_id') or '', {})
+    b = brands.get(t.get('brand_id') or '', {})
+    aliases = [a for a in (b.get('aliases') or []) if isinstance(a, str) and a.strip()]
+    return {'site': s.get('name') or t.get('site') or '', 'brand': b.get('name') or t.get('brand') or '',
+            'aliases': aliases, 'kind': s.get('kind') if s.get('kind') in ('new', 'used') else 'new',
+            'site_id': t.get('site_id'), 'brand_id': t.get('brand_id')}
+
+
+def brand_matches(vendor, names):
+    v = norm(vendor)
+    if not v:
+        return True
+    for n in names:
+        n = norm(n)
+        if n and (n in v or v in n):
+            return True
+    return False
+
+
 def is_full(t, cat, date):
     if not cat or not cat.get('baseline_done'):
         return True
@@ -131,13 +168,15 @@ def is_full(t, cat, date):
 
 def cmd_pages(date):
     targets, cats = docs('targets'), docs('catalog')
+    sites, brands = docs('sites'), docs('brands')
     plan = []
     for tid, t in targets.items():
-        if t.get('active') is False:
+        if t.get('active') is False or not t.get('url'):
             continue
         cat = cats.get(tid)
         full = is_full(t, cat, date)
-        plan.append({'tid': tid, 'brand': t.get('brand'), 'site': t.get('site'), 'url': t['url'],
+        r = resolve(t, sites, brands)
+        plan.append({'tid': tid, 'brand': r['brand'], 'site': r['site'], 'url': t['url'],
                      'platform': platform(t['url']), 'mode': 'full' if full else 'daily',
                      'daily_pages': int(t.get('daily_pages', 2) or 2) if not full else None,
                      'all_rows_pages': int(t.get('daily_pages', 2) or 2) or 2,
@@ -145,9 +184,9 @@ def cmd_pages(date):
     dump(os.path.join(FW, 'pages.json'), plan)
     for p in plan:
         if p['mode'] == 'full':
-            how = f"ALL pages (pages 1-{p['all_rows_pages']}: every product; later pages: in-stock only)"
+            how = f"ALL pages (K={p['all_rows_pages']}: pages 1-{p['all_rows_pages']} -> scan/{p['tid']}.txt, later pages -> scan/{p['tid']}.deep.txt)"
         else:
-            how = f"pages 1-{p['daily_pages']} only (every product)"
+            how = f"pages 1-{p['daily_pages']} only (K={p['daily_pages']}) -> scan/{p['tid']}.txt"
         print(f"{p['tid']}\t{p['brand']} @ {p['site']}\t{p['platform']}\t{p['url']}\t{how}"
               + ("\tBASELINE (no notifications)" if p['baseline'] else ''))
     if not plan:
@@ -210,25 +249,28 @@ def cmd_apply(date, hhmm):
             feed['events'].append(ev)
             new_events.append(ev)
 
+    sites, brands = docs('sites'), docs('brands')
     for tid, p in plan.items():
         t = targets.get(tid, {})
+        rs = resolve(t, sites, brands)
         cat = cats.get(tid) or {'items': {}}
-        cat.update({'target_id': tid, 'site': t.get('site'), 'brand': t.get('brand'),
+        cat.update({'target_id': tid, 'site': rs['site'], 'brand': rs['brand'], 'site_id': rs['site_id'],
+                    'brand_id': rs['brand_id'], 'kind': rs['kind'],
                     'url': t.get('url'), 'origin': origin(t.get('url', ''))})
         items = cat.setdefault('items', {})
         rows, err = parse_scan(tid)
         cat['last_checked'] = now_iso
         if err and not rows:
             cat['status'], cat['status_msg'] = 'error', f'{date} 読み込めませんでした（{err}）'
-            errors.append({'target_id': tid, 'brand': t.get('brand'), 'msg': err})
+            errors.append({'target_id': tid, 'brand': rs['brand'], 'msg': err})
             dump(os.path.join(FW, 'out', 'catalog', f'{tid}.json'), cat)
             written.append(f'catalog/{tid}')
             continue
         baseline = not cat.get('baseline_done')
         full = p['mode'] == 'full'
         prev_stock = [k for k, it in items.items() if it.get('in_stock')]
-        base_ev = {'date': date, 'target_id': tid, 'site': t.get('site'), 'brand': t.get('brand')}
-        want_brand = norm(t.get('brand'))
+        base_ev = {'date': date, 'target_id': tid, 'site': rs['site'], 'brand': rs['brand'], 'kind': rs['kind']}
+        brand_names = [rs['brand']] + rs['aliases']
         for k, row in rows.items():
             v = verified.get(f'{tid}|{k}')
             v = v if isinstance(v, dict) else None
@@ -238,7 +280,7 @@ def cmd_apply(date, hhmm):
             vsizes = [str(z)[:20] for z in v['sizes'][:12]] if v and isinstance(v.get('sizes'), list) else None
             it = items.get(k)
             if not it:
-                if v and v.get('brand') and want_brand and want_brand not in norm(v['brand']) and norm(v['brand']) not in want_brand:
+                if v and v.get('brand') and not brand_matches(v['brand'], brand_names):
                     continue  # another brand's product picked up from the page
                 price = int(vprice or row['price'])
                 stock = row['in_stock'] if vstock is None else vstock
@@ -249,10 +291,12 @@ def cmd_apply(date, hhmm):
                     items[k]['image'] = vimg
                 if vsizes is not None:
                     items[k]['sizes'] = vsizes
+                if row.get('gender'):
+                    items[k]['gender'] = row['gender']
                 if not baseline and stock:
                     add_event({**base_ev, 'type': 'new', 'key': k, 'title': row['title'],
-                               'url': cat['origin'] + k, 'image': vimg, 'price': price, 'old_price': None,
-                               'list_price': price, 'in_stock': True})
+                               'url': cat['origin'] + k, 'image': vimg, 'gender': row.get('gender'),
+                               'price': price, 'old_price': None, 'list_price': price, 'in_stock': True})
                 continue
             it['title'] = row['title'] or it.get('title')
             it['last_seen'] = date
@@ -260,6 +304,8 @@ def cmd_apply(date, hhmm):
                 it['image'] = vimg
             if vsizes is not None:
                 it['sizes'] = vsizes
+            if row.get('gender'):
+                it['gender'] = row['gender']
             if row['deep'] and row['in_stock'] and not it.get('in_stock'):
                 it['in_stock'] = bool(vstock)  # deep pages may miss sold-out badges: trust only a verified restock
             else:
@@ -270,10 +316,10 @@ def cmd_apply(date, hhmm):
                 it['price'] = new
                 it.setdefault('history', []).append([date, new])
                 it['list_price'] = max(it.get('list_price', 0), old, new)
-                if new < old and not baseline:
+                if new < old and not baseline and it['in_stock']:  # only tell about markdowns you can buy
                     add_event({**base_ev, 'type': 'drop', 'key': k, 'title': it['title'],
-                               'url': cat['origin'] + k, 'image': it.get('image'), 'price': new, 'old_price': old,
-                               'list_price': it['list_price'], 'in_stock': it['in_stock']})
+                               'url': cat['origin'] + k, 'image': it.get('image'), 'gender': it.get('gender'),
+                               'price': new, 'old_price': old, 'list_price': it['list_price'], 'in_stock': True})
         for vk, vv in verified.items():  # photo backfill for items not on today's pages
             if vk.startswith(tid + '|') and isinstance(vv, dict):
                 k = vk[len(tid) + 1:]
@@ -354,9 +400,12 @@ def cmd_want(repo):
             img = img_url(it.get('image'))
             if it.get('in_stock') and img:
                 want[photo_id(tid, k)] = img
-    tlist = [{'id': tid, 'site': t.get('site'), 'brand': t.get('brand'), 'url': t.get('url'),
-              'active': t.get('active', True) is not False, 'fetch_data': False}
-             for tid, t in sorted(targets.items())]
+    sites, brands = docs('sites'), docs('brands')
+    tlist = []
+    for tid, t in sorted(targets.items()):
+        r = resolve(t, sites, brands)
+        tlist.append({'id': tid, 'site': r['site'], 'brand': r['brand'], 'kind': r['kind'], 'url': t.get('url'),
+                      'active': t.get('active', True) is not False, 'fetch_data': False})
     changed = []
     for name, obj in (('want.json', {'photos': want}), ('targets.json', {'targets': tlist})):
         path = os.path.join(repo, name)
