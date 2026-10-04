@@ -1,0 +1,11 @@
+{
+  "targets": [
+    {
+      "id": "t-ciacura-auralee",
+      "site": "着楽 ciacura",
+      "brand": "AURALEE",
+      "url": "https://shop.ciacura.jp/collections/auralee",
+      "active": true
+    }
+  ]
+}
