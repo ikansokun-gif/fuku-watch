@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - targets.json
+      - want.json
       - scripts/fetch.py
       - .github/workflows/fetch.yml
 

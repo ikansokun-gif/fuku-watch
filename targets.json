@@ -5,7 +5,8 @@
       "site": "着楽 ciacura",
       "brand": "AURALEE",
       "url": "https://shop.ciacura.jp/collections/auralee",
-      "active": true
+      "active": true,
+      "fetch_data": false
     }
   ]
 }

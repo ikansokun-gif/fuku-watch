@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """服セールウォッチ: fetch shop data and product photos (runs on GitHub Actions).
 
-Reads targets.json, and for every active Shopify collection:
-  - reads the shop's public product data (<collection>/products.json)
-  - writes data/<target id>.json   (in-stock products + products that sold out recently)
-  - saves a small photo of every in-stock product to thumbs/<photo id>.jpg
+1. Photos: want.json (written by Claude's morning run) lists the photo URL of every
+   in-stock product. Each one is saved, small, to thumbs/<photo id>.jpg.
+2. Data (best effort): for every active Shopify collection in targets.json, reads the
+   shop's public product data (<collection>/products.json) into data/<target id>.json.
+   Some shops refuse requests from GitHub's servers (HTTP 429); then the file records
+   the error and Claude reads the shop's pages itself instead.
 Claude's morning run reads these files and puts them on the 服セールウォッチ page.
 """
 import datetime
@@ -40,6 +42,15 @@ def get(url, tries=3):
             last = e
             if e.code in (401, 403, 404):
                 break
+            if e.code == 429:  # the shop says slow down: wait as asked, at most once
+                if i > 0:
+                    break
+                try:
+                    wait = int(e.headers.get('Retry-After') or 30)
+                except ValueError:
+                    wait = 30
+                time.sleep(min(max(wait, 10), 60))
+                continue
         except Exception as e:  # network hiccup
             last = e
         time.sleep(3 * (i + 1))
@@ -114,12 +125,16 @@ def main():
     index_path = 'thumbs/index.json'
     index = json.load(open(index_path)) if os.path.exists(index_path) else {}
     keep, processed, report = set(), [], []
+    want = json.load(open('want.json', encoding='utf-8')) if os.path.exists('want.json') else {}
+    want = want.get('photos', want) if isinstance(want, dict) else {}
 
     for t in targets:
         tid, url = t.get('id'), t.get('url', '')
         if not tid or t.get('active') is False or not is_shopify(url):
             continue
         processed.append(tid)
+        if t.get('fetch_data') is not True:  # off unless turned on for a shop that allows it
+            continue
         record = {'target_id': tid, 'url': url, 'brand': t.get('brand'),
                   'fetched_at': now.isoformat(timespec='seconds'), 'products': {}}
         try:
@@ -136,32 +151,37 @@ def main():
             if not s['available'] and s['published_at'] < cutoff:
                 continue
             record['products']['/products/' + p['handle']] = s
-        new_photos = failed = 0
         for key, s in record['products'].items():
-            if not s['available'] or not s['image']:
-                continue
-            pid = photo_id(tid, key)
-            keep.add(pid)
-            path = f'thumbs/{pid}.jpg'
-            if os.path.exists(path) and index.get(pid) == s['image']:
-                continue
-            try:
-                save_thumb(s['image'], path)
-                index[pid] = s['image']
-                new_photos += 1
-                time.sleep(0.3)
-            except Exception as e:
-                failed += 1
-                print(f'photo failed {key}: {e}', file=sys.stderr)
+            if s['available'] and s['image']:
+                want.setdefault(photo_id(tid, key), s['image'])
         json.dump(record, open(f'data/{tid}.json', 'w', encoding='utf-8'),
                   ensure_ascii=False, separators=(',', ':'), sort_keys=True)
-        report.append(f'{tid}: {len(products)} products, kept {len(record["products"])}, '
-                      f'new photos {new_photos}, failed {failed}')
+        report.append(f'{tid}: {len(products)} products, kept {len(record["products"])}')
 
-    # drop photos of products that are no longer in stock (only for targets processed this run)
-    prefixes = tuple(photo_id(tid, '') for tid in processed)
+    new_photos = failed = 0
+    for pid, src in sorted(want.items()):
+        if not isinstance(src, str) or not src:
+            continue
+        src = 'https:' + src if src.startswith('//') else src
+        if not src.startswith('https://'):
+            continue
+        keep.add(pid)
+        path = f'thumbs/{pid}.jpg'
+        if os.path.exists(path) and index.get(pid) == src:
+            continue
+        try:
+            save_thumb(src, path)
+            index[pid] = src
+            new_photos += 1
+            time.sleep(0.2)
+        except Exception as e:
+            failed += 1
+            print(f'photo failed {pid}: {e}', file=sys.stderr)
+    report.append(f'photos wanted {len(want)}, new {new_photos}, failed {failed}')
+
+    # drop photos nobody wants any more (no longer in stock, or target removed)
     for pid in list(index):
-        if pid.startswith(prefixes) and pid not in keep:
+        if pid not in keep:
             index.pop(pid, None)
             try:
                 os.remove(f'thumbs/{pid}.jpg')

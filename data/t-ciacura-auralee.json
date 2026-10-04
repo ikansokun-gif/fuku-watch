@@ -1,8 +1,0 @@
-{
-"target_id": "t-ciacura-auralee",
-"url": "https://shop.ciacura.jp/collections/auralee",
-"brand": "AURALEE",
-"fetched_at": "2026-10-04T15:51:32+09:00",
-"products": {},
-"error": "https://shop.ciacura.jp/collections/auralee/products.json?limit=250&page=1: HTTP Error 429: Too Many Requests"
-}
