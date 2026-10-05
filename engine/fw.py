@@ -76,6 +76,9 @@ def key_of(path):
     i = path.find('/products/')
     if i >= 0:
         path = path[i:]
+    m = re.match(r'^/?\??((?:pid|id|item_id)=\d+)', path)   # ColorMeShop style: /?pid=123 (or /pid=123)
+    if m:
+        return '/?' + m.group(1)
     path = path.split('?')[0].split('#')[0].rstrip('/')
     return path if path.startswith('/') else '/' + path
 
@@ -119,7 +122,7 @@ def parse_scan(tid):
         rows.setdefault(k, r)
     error = err or err2
     if not rows and not error:
-        error = 'no products found on the page'
+        error = 'no in-stock products found (all sold out, or the page could not be read)'
     return rows, error
 
 
