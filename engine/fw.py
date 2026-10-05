@@ -72,7 +72,8 @@ def origin(url):
 def key_of(path):
     path = path.strip()
     if path.startswith('http'):
-        path = urlparse(path).path
+        u = urlparse(path)
+        path = u.path + (('?' + u.query) if u.query else '')
     i = path.find('/products/')
     if i >= 0:
         path = path[i:]
