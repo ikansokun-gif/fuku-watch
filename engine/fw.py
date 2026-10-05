@@ -175,9 +175,10 @@ def is_full(t, cat, date):
     return datetime.date.fromisoformat(date).weekday() == 6  # Sunday
 
 
-def cmd_pages(date):
+def cmd_pages(date, only=None):
     targets, cats = docs('targets'), docs('catalog')
     sites, brands = docs('sites'), docs('brands')
+    only = set(only.split(',')) if only else None   # one-off full scan of these site ids
     plan = []
     for tid, t in targets.items():
         if t.get('active') is False or not t.get('url'):
@@ -185,6 +186,10 @@ def cmd_pages(date):
         cat = cats.get(tid)
         full = is_full(t, cat, date)
         r = resolve(t, sites, brands)
+        if only is not None:
+            if r['site_id'] not in only:
+                continue
+            full = True
         plan.append({'tid': tid, 'brand': r['brand'], 'site': r['site'], 'url': t['url'],
                      'platform': platform(t['url']), 'mode': 'full' if full else 'daily',
                      'daily_pages': (int(t.get('daily_pages', 2) or 0) or 3) if not full else None,
@@ -481,7 +486,8 @@ def safe_id(x):
     return re.sub(r'[^A-Za-z0-9_\-.~:@+]', '_', x)[:150]
 
 
-def cmd_discover(date):
+def cmd_discover(date, only=None):
+    only = set(only.split(',')) if only else None   # re-check these site ids now, ignoring the retry wait
     sites, brands, targets = docs('sites'), docs('brands'), docs('targets')
     rec = (load(os.path.join(FW, 'meta', 'discovery.json')) or {}).get('pairs', {})
     cutoff = (datetime.date.fromisoformat(date) - datetime.timedelta(days=DISCOVER_RETRY_DAYS)).isoformat()
@@ -492,12 +498,14 @@ def cmd_discover(date):
         tpl = (st.get('search_url') or '').strip()
         if st.get('auto') is False or st.get('auto_active') is False or not (idx or '{q}' in tpl):
             continue
+        if only is not None and sid not in only:
+            continue
         pend = []
         for bid, b in sorted(brands.items()):
             if (sid, bid) in have:
                 continue
             r = rec.get(f'{sid}|{bid}')
-            if r and r.get('date', '') > cutoff and r.get('names') == brand_names(b):
+            if only is None and r and r.get('date', '') > cutoff and r.get('names') == brand_names(b):
                 continue
             pend.append(bid)
         if not pend:
